@@ -1,14 +1,17 @@
 package main
 
 import (
+	"context"
 	"flag"
 	"log"
 	"net/http"
 	"os"
 	"os/signal"
 	"syscall"
+	"time"
 
 	"github.com/keepdevops/cofiswarm-infer-llama/internal/bus"
+	"github.com/keepdevops/cofiswarm-observer-sdk/pkg/buspresence"
 	"github.com/keepdevops/cofiswarm-observer-sdk/pkg/servicecomponent"
 )
 
@@ -31,8 +34,31 @@ func main() {
 		w.Header().Set("Content-Type", "application/json")
 		_, _ = w.Write([]byte(`{"engine":"llama","stub":true,"note":"run deploy/Dockerfile for full llama-metal"}`))
 	})
-	log.Printf("infer-llama metadata on %s", *addr)
-	log.Fatal(http.ListenAndServe(*addr, mux))
+
+	// Carrier presence (broker-free, default-off via COFISWARM_BRIDGE_URL): appear in the
+	// observer live roster over the zmq-bridge without needing a NATS broker. HTTP /healthz
+	// + /v1/info remain the request/reply surface.
+	stopPresence := buspresence.StartPresence(os.Getenv("COFISWARM_BRIDGE_URL"), "infer-llama", map[string]any{"name": "infer-llama"})
+
+	httpSrv := &http.Server{Addr: *addr, Handler: mux}
+	go func() {
+		log.Printf("infer-llama metadata on %s", *addr)
+		if err := httpSrv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
+			log.Fatalf("infer-llama: server error: %v", err)
+		}
+	}()
+
+	// On SIGINT/SIGTERM: say goodbye (flip offline now, not after the TTL) then drain HTTP.
+	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
+	defer stop()
+	<-ctx.Done()
+	log.Printf("infer-llama: shutting down")
+	stopPresence() // carrier goodbye -> offline
+	shutCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	if err := httpSrv.Shutdown(shutCtx); err != nil {
+		log.Printf("infer-llama: graceful shutdown: %v", err)
+	}
 }
 
 // serveBus announces infer-llama on the observer bus and serves its .infer.llama.* capability
